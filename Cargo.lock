@@ -365,6 +365,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "bindgen"
+version = "0.73.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "787ef8ef523575546b106a58213d6e6b06198a05c2f757258c68a74273670cfa"
+dependencies = [
+ "bitflags 2.13.1",
+ "cexpr",
+ "clang-sys",
+ "log",
+ "prettyplease",
+ "proc-macro2",
+ "quote",
+ "regex",
+ "rustc-hash 2.1.3",
+ "shlex 2.0.1",
+ "syn 3.0.3",
+]
+
+[[package]]
 name = "bitbybit"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2948,7 +2967,7 @@ dependencies = [
 name = "libafl_qemu_build"
 version = "0.16.1"
 dependencies = [
- "bindgen 0.72.1",
+ "bindgen 0.73.2",
  "cc",
  "json",
  "rustc_version 0.4.1",
@@ -3007,7 +3026,7 @@ name = "libafl_targets"
 version = "0.16.1"
 dependencies = [
  "backtrace",
- "bindgen 0.72.1",
+ "bindgen 0.73.2",
  "cc",
  "document-features",
  "fast_rands",
@@ -3211,7 +3230,7 @@ dependencies = [
 name = "libvharness_sys"
 version = "0.16.1"
 dependencies = [
- "bindgen 0.72.1",
+ "bindgen 0.73.2",
  "cmake",
 ]
 

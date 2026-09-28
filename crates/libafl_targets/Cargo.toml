@@ -196,7 +196,7 @@ observers = ["meminterval"]
 document-features = ["dep:document-features"]
 
 [build-dependencies]
-bindgen = "0.72.1"
+bindgen = "0.73.2"
 cc = { version = "1.4.0", features = ["parallel"] }
 rustversion = { workspace = true }
 
