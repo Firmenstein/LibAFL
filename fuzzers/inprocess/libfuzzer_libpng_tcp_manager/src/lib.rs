@@ -1,0 +1,209 @@
+//! A libfuzzer-like fuzzer with llmp-multithreading support and restarts
+//! The example harness is built for libpng.
+use core::time::Duration;
+#[cfg(feature = "crash")]
+use std::ptr;
+use std::{env, path::PathBuf};
+
+use libafl::{
+    corpus::{Corpus, InMemoryCorpus, OnDiskCorpus},
+    events::{tcp::setup_restarting_mgr_tcp, EventConfig, EventRestarter},
+    executors::{inprocess::InProcessExecutor, ExitKind},
+    feedback_or, feedback_or_fast,
+    feedbacks::{CrashFeedback, MaxMapFeedback, TimeFeedback, TimeoutFeedback},
+    fuzzer::{Fuzzer, StdFuzzer},
+    inputs::{BytesInput, HasTargetBytes},
+    mutators::{
+        havoc_mutations::havoc_mutations,
+        scheduled::{tokens_mutations, HavocScheduledMutator},
+        token_mutations::Tokens,
+    },
+    observers::{CanTrack, HitcountsMapObserver, StdMapObserver, TimeObserver},
+    schedulers::{
+        powersched::PowerSchedule, IndexesLenTimeMinimizerScheduler, StdWeightedScheduler,
+    },
+    stages::{calibrate::CalibrationStage, power::StdPowerMutationalStage},
+    state::{HasCorpus, StdState},
+    Error, HasMetadata,
+};
+use libafl_bolts::{
+    rands::StdRand,
+    tuples::{tuple_list, Merge},
+};
+use libafl_targets::{libfuzzer_initialize, libfuzzer_test_one_input, EDGES_MAP, MAX_EDGES_FOUND};
+use mimalloc::MiMalloc;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
+/// The main fn, `no_mangle` as it is a C main
+#[no_mangle]
+pub extern "C" fn libafl_main() {
+    // Registry the metadata types used in this fuzzer
+    // Needed only on no_std
+    // unsafe { RegistryBuilder::register::<Tokens>(); }
+
+    println!(
+        "Workdir: {:?}",
+        env::current_dir().unwrap().to_string_lossy().to_string()
+    );
+
+    #[cfg(feature = "prometheus")]
+    let monitor = (
+        libafl::monitors::PrometheusMonitor::new("127.0.0.1:8080"),
+        libafl::monitors::SimpleMonitor::new(|s| eprintln!("{s}")),
+    );
+    #[cfg(not(feature = "prometheus"))]
+    let monitor = libafl::monitors::SimpleMonitor::new(|s| eprintln!("{s}"));
+
+    libafl_bolts::SimpleStdoutLogger::set_logger().unwrap();
+    log::set_max_level(log::LevelFilter::Info);
+
+    let broker_port = env::var("FUZZER_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1337);
+
+    let (state, mut restarting_mgr) =
+        match setup_restarting_mgr_tcp(monitor, broker_port, EventConfig::AlwaysUnique) {
+            Ok(res) => res,
+            Err(err) => match err {
+                Error::ShuttingDown => {
+                    return;
+                }
+                _ => {
+                    panic!("Failed to setup the restarter: {err}");
+                }
+            },
+        };
+
+    // Create an observation channel using the coverage map
+    // TODO: This will break soon, fix me! See https://github.com/AFLplusplus/LibAFL/issues/2786
+    #[allow(static_mut_refs)] // only a problem on nightly
+    let edges_observer = unsafe {
+        HitcountsMapObserver::new(StdMapObserver::from_mut_ptr(
+            "edges",
+            EDGES_MAP.as_mut_ptr(),
+            MAX_EDGES_FOUND,
+        ))
+        .track_indices()
+    };
+
+    // Create an observation channel to keep track of the execution time
+    let time_observer = TimeObserver::new("time");
+
+    let map_feedback = MaxMapFeedback::new(&edges_observer);
+
+    let calibration = CalibrationStage::new(&map_feedback);
+
+    // Feedback to rate the interestingness of an input
+    let mut feedback = feedback_or!(map_feedback, TimeFeedback::new(&time_observer));
+
+    // A feedback to choose if an input is a solution or not
+    let mut objective = feedback_or_fast!(CrashFeedback::new(), TimeoutFeedback::new());
+
+    // If not restarting, create a State from scratch
+    let mut state = state.unwrap_or_else(|| {
+        let objective_dir = PathBuf::from("./crashes");
+        StdState::new(
+            StdRand::new(),
+            InMemoryCorpus::new(),
+            OnDiskCorpus::new(objective_dir).unwrap(),
+            &mut feedback,
+            &mut objective,
+        )
+        .unwrap()
+    });
+
+    println!("We're a client, let's fuzz :)");
+
+    // Create a PNG dictionary if not existing
+    if state.metadata_map().get::<Tokens>().is_none() {
+        state.add_metadata(Tokens::from([
+            vec![137, 80, 78, 71, 13, 10, 26, 10], // PNG header
+            "IHDR".as_bytes().to_vec(),
+            "IDAT".as_bytes().to_vec(),
+            "PLTE".as_bytes().to_vec(),
+            "IEND".as_bytes().to_vec(),
+        ]));
+    }
+
+    // Setup a basic mutator with a mutational stage
+    let mutator = HavocScheduledMutator::new(havoc_mutations().merge(tokens_mutations()));
+    let power = StdPowerMutationalStage::new(mutator);
+    let mut stages = tuple_list!(calibration, power);
+
+    // A minimization+queue policy to get testcasess from the corpus
+    let scheduler = IndexesLenTimeMinimizerScheduler::new(
+        &edges_observer,
+        StdWeightedScheduler::with_schedule(
+            &mut state,
+            &edges_observer,
+            Some(PowerSchedule::fast()),
+        ),
+    );
+
+    // A fuzzer with feedbacks and a corpus scheduler
+    let mut fuzzer = StdFuzzer::new(scheduler, feedback, objective);
+
+    // The wrapped harness function, calling out to the LLVM-style harness
+    let mut harness = |input: &BytesInput| {
+        let target = input.target_bytes();
+        let buf = &target;
+        #[cfg(feature = "crash")]
+        if buf.len() > 4 && buf[4] == 0 {
+            unsafe {
+                eprintln!("Crashing (for testing purposes)");
+                let addr = ptr::null_mut();
+                *addr = 1;
+            }
+        }
+        unsafe {
+            libfuzzer_test_one_input(buf);
+        }
+        ExitKind::Ok
+    };
+
+    // Create the executor for an in-process function with one observer for edge coverage and one for the execution time
+    let mut executor = InProcessExecutor::builder()
+        .timeout(Duration::from_secs(10))
+        .harness(&mut harness)
+        .observers(tuple_list!(edges_observer, time_observer))
+        .fuzzer(&mut fuzzer)
+        .state(&mut state)
+        .event_mgr(&mut restarting_mgr)
+        .build()
+        .expect("Failed to create executor");
+
+    // The actual target run starts here.
+    // Call LLVMFUzzerInitialize() if present.
+    let args: Vec<String> = env::args().collect();
+    if unsafe { libfuzzer_initialize(&args) } == -1 {
+        println!("Warning: LLVMFuzzerInitialize failed with -1");
+    }
+
+    // In case the corpus is empty (on first run), reset
+    if state.must_load_initial_inputs() {
+        state
+            .load_initial_inputs(
+                &mut fuzzer,
+                &mut executor,
+                &mut restarting_mgr,
+                &[PathBuf::from("./corpus")],
+            )
+            .unwrap_or_else(|err| panic!("Failed to load initial corpus: {err}"));
+        println!("We imported {} inputs from disk.", state.corpus().count());
+    }
+
+    fuzzer
+        .fuzz_loop_for(
+            &mut stages,
+            &mut executor,
+            &mut state,
+            &mut restarting_mgr,
+            1_000_000,
+        )
+        .unwrap();
+
+    restarting_mgr.on_restart(&mut state).unwrap();
+}

@@ -1,0 +1,13 @@
+[package]
+name = "tinyinst_simple"
+version = "0.16.1"
+edition = "2021"
+
+[dependencies]
+libafl = { path = "../../../crates/libafl", features = ["introspection"] }
+libafl_bolts = { path = "../../../crates/libafl_bolts" }
+libafl_tinyinst = { path = "../../../crates/libafl_tinyinst" }
+
+[profile.release]
+codegen-units = 1
+opt-level = 3

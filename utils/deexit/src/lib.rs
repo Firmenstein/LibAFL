@@ -1,0 +1,34 @@
+//! A simple wrapper that can be inserted into a program to turn `exit` calls to `abort`, which `LibAFL` will be able to catch.
+//! If you are on `MacOS`, use the env variables `DYLD_INSERT_LIBRARIES="path/to/target/release/libdeexit.dylib" tool`
+//! On Linux, use `LD_PRELOAD="path/to/target/release/libdeexit.so" tool`.
+
+unsafe extern "C" {
+    fn abort() -> !;
+}
+
+/// Hooked `exit` function
+///
+/// # Safety
+///
+/// This function is unsafe because it overrides the standard C `exit` symbol.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn exit(status: i32) -> ! {
+    println!("DeExit: The target called exit with status code {status}");
+    unsafe {
+        abort();
+    }
+}
+
+#[cfg(target_os = "macos")]
+use ctor::ctor;
+
+#[cfg(target_os = "macos")]
+#[ctor(unsafe)]
+fn init() {
+    unsafe {
+        fishhook::register(vec![fishhook::Rebinding {
+            name: "exit".to_string(),
+            function: exit as *const () as usize,
+        }]);
+    }
+}

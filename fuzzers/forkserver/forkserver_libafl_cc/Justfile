@@ -1,0 +1,85 @@
+FUZZER_NAME := 'fuzzer_libafl_cc'
+FORKSERVER_NAME := 'forkserver_libafl_cc'
+CARGO_TARGET_DIR := env("CARGO_TARGET_DIR", "target")
+PROFILE := env("PROFILE", "release")
+PROFILE_DIR := if PROFILE == "release" { "release" } else if PROFILE == "dev" { "debug" } else { "debug" }
+LIBAFL_CC := CARGO_TARGET_DIR / PROFILE_DIR / "libafl_cc"
+LIBAFL_CXX := CARGO_TARGET_DIR / PROFILE_DIR / "libafl_cxx"
+FUZZER := CARGO_TARGET_DIR / PROFILE_DIR / FUZZER_NAME
+FORKSERVER := CARGO_TARGET_DIR / PROFILE_DIR / FORKSERVER_NAME
+PROJECT_DIR := absolute_path(".")
+
+alias cc := cxx
+
+[linux]
+[macos]
+libpng:
+    #!/bin/bash
+    if [ ! -f v1.6.37.tar.gz ]; then
+        wget https://github.com/glennrp/libpng/archive/refs/tags/v1.6.37.tar.gz
+    fi
+    tar -xvf v1.6.37.tar.gz
+
+[windows]
+libpng:
+    echo "Unsupported on this platform"
+
+[linux]
+[macos]
+cxx:
+    cargo build --profile {{ PROFILE }}
+
+[windows]
+cxx:
+    echo "Unsupported on this platform"
+
+[linux]
+[macos]
+fuzzer: cxx
+    {{ LIBAFL_CC }} {{ PROJECT_DIR }}/src/program.c -o {{ FUZZER_NAME }} -lm -lz
+
+[windows]
+fuzzer:
+    echo "Unsupported on this platform"
+
+[linux]
+[macos]
+run: fuzzer
+    #!/bin/bash
+    taskset -c 1 {{ FORKSERVER }} ./{{ FUZZER_NAME }} ./corpus/ -t 1000
+
+[windows]
+run: fuzzer
+    echo "Unsupported on this platform"
+
+[linux]
+[macos]
+test: fuzzer
+    #!/bin/bash
+    CRASH_DIR="crashes"
+    QUEUE_DIR="corpus_discovered"
+    timeout 30s {{ FORKSERVER }} -G 10 -t 5000 ./{{ FUZZER_NAME }} ./corpus/ || true
+
+    # Print off the crashes/queue for testing before we delete, but don't fail the job
+    find "${CRASH_DIR}" "${QUEUE_DIR}" -type f -name '[0-9a-f]*' -print -exec od -A x -t x1 -c {} \; 2>/dev/null || true
+
+    if find "${CRASH_DIR}" -type f -name '[0-9a-f]*' -printf '.' 2>/dev/null | grep -q .; then
+        echo "Good, Fuzzer found a crash"
+    else
+        echo "Fuzzer did not find a crashing input, and should have"
+        exit 1
+    fi
+
+    # Cleanup the crashes/queue dirs so that subsequent tests don't pick up
+    # previous crashes/findings.
+    # already exited if failed, keep around to debug
+    rm -r "${CRASH_DIR}" "${QUEUE_DIR}"
+
+[windows]
+test: fuzzer
+    echo "Unsupported on this platform"
+
+clean:
+    rm -rf {{ FUZZER_NAME }}
+    make -C libpng-1.6.37 clean || true
+    cargo clean

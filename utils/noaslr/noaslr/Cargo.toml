@@ -1,0 +1,27 @@
+[package]
+name = "noaslr"
+version = "0.16.1"
+edition = "2024"
+
+[build-dependencies]
+vergen = { version = "10.0.1", features = ["build", "cargo", "rustc", "si"] }
+vergen-git2 = "10.0.1"
+
+[dependencies]
+anyhow = { version = "1.0", default-features = false }
+clap = { version = "4.5", default-features = false, features = [
+  "derive",
+  "string",
+  "std",
+  "help",
+  "derive",
+  "error-context",
+  "usage",
+] }
+nix = { version = "0.31.2", default-features = false, features = [
+  "process",
+  "personality",
+] }
+readonly = { version = "0.2.8", default-features = false }
+[target.'cfg(any(target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd"))'.dependencies]
+libc = "0.2"

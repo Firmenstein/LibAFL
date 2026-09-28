@@ -1,0 +1,143 @@
+use std::{hint::black_box, num::NonZero, path::PathBuf, process, slice, time::Duration};
+
+use libafl::{
+    corpus::{InMemoryCorpus, OnDiskCorpus},
+    events::SimpleEventManager,
+    executors::{
+        hooks::intel_pt::{IntelPT, IntelPTHook, PtImage},
+        inprocess::GenericInProcessExecutor,
+        ExitKind,
+    },
+    feedbacks::{CrashFeedback, MaxMapFeedback},
+    fuzzer::{Fuzzer, StdFuzzer},
+    generators::RandPrintablesGenerator,
+    inputs::{BytesInput, HasTargetBytes},
+    monitors::SimpleMonitor,
+    mutators::{havoc_mutations::havoc_mutations, scheduled::HavocScheduledMutator},
+    observers::ConstMapObserver,
+    schedulers::QueueScheduler,
+    stages::mutational::StdMutationalStage,
+    state::StdState,
+};
+use libafl_bolts::{current_nanos, nonnull_raw_mut, rands::StdRand, tuples::tuple_list};
+use proc_maps::get_process_maps;
+
+// Edge coverage map.
+const MAP_SIZE: usize = 4096;
+static mut MAP: [u8; MAP_SIZE] = [0; MAP_SIZE];
+static mut MAP_PTR: *mut u8 = &raw mut MAP as _;
+
+pub fn main() {
+    env_logger::init();
+
+    // The function that we want to fuzz
+    let mut harness = |input: &BytesInput| {
+        let buf = input.target_bytes();
+        if !buf.is_empty() && buf[0] == b'a' {
+            // Avoid compiler optimizations
+            let _do_something = black_box(0);
+            if buf.len() > 1 && buf[1] == b'b' {
+                let _do_something = black_box(0);
+                if buf.len() > 2 && buf[2] == b'c' {
+                    panic!("Artificial bug triggered =)");
+                }
+            }
+        }
+        ExitKind::Ok
+    };
+
+    // Create an observation channel using the map
+    let observer = unsafe { ConstMapObserver::from_mut_ptr("edges", nonnull_raw_mut!(MAP)) };
+
+    // Feedback to rate the interestingness of an input
+    let mut feedback = MaxMapFeedback::new(&observer);
+
+    // A feedback to choose if an input is a solution or not
+    let mut objective = CrashFeedback::new();
+
+    let mut state = StdState::new(
+        // Random Number Generator
+        StdRand::with_seed(current_nanos()),
+        // Corpus that will be evolved, we keep it in memory for performance
+        InMemoryCorpus::new(),
+        // Corpus in which we store solutions (crashes in this example),
+        // on disk so the user can get them after stopping the fuzzer
+        OnDiskCorpus::new(PathBuf::from("./crashes")).unwrap(),
+        // States of the feedbacks.
+        // The feedbacks can report the data that should persist in the State.
+        &mut feedback,
+        // Same for objective feedbacks
+        &mut objective,
+    )
+    .unwrap();
+
+    // The Monitor define how the fuzzer stats are displayed to the user, here we simply print
+    let mon = SimpleMonitor::new(|s| println!("{s}"));
+
+    // The event manager handle the various events generated during the fuzzing loop
+    // such as the notification of the addition of a new item to the corpus
+    let mut mgr = SimpleEventManager::new(mon);
+
+    // A queue policy to get testcases from the corpus
+    let scheduler = QueueScheduler::new();
+
+    // A fuzzer with feedbacks and a corpus scheduler
+    let mut fuzzer = StdFuzzer::new(scheduler, feedback, objective);
+
+    // Get the memory map of the current process, copy the executable memory that will be
+    // disassembled and used for Intel PT trace decoding
+    let my_pid = process::id();
+    #[cfg_attr(windows, expect(clippy::useless_conversion))]
+    let process_maps = get_process_maps(my_pid.try_into().unwrap()).unwrap();
+    let images = process_maps
+        .iter()
+        .filter_map(|pm| {
+            if pm.is_exec() {
+                let data = unsafe { slice::from_raw_parts(pm.start() as *const u8, pm.size()) };
+                Some(PtImage::new(data, pm.start() as u64))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+
+    // Pass the executable memory to the code responsible for Intel PT trace decoding
+    let pt = IntelPT::builder().images(&images).build().unwrap();
+
+    // Intel PT hook that will handle the setup of Intel PT for each execution and fill the map
+    let pt_hook = unsafe {
+        IntelPTHook::builder()
+            .intel_pt(pt)
+            .map_ptr(MAP_PTR)
+            .map_len(MAP_SIZE)
+    }
+    .build();
+
+    // Create the executor for an in-process function with just one observer
+    let mut executor = GenericInProcessExecutor::builder_generic()
+        .timeout(Duration::from_millis(5000))
+        .harness(&mut harness)
+        .user_hooks(tuple_list!(pt_hook))
+        .observers(tuple_list!(observer))
+        .fuzzer(&mut fuzzer)
+        .state(&mut state)
+        .event_mgr(&mut mgr)
+        .build()
+        .expect("Failed to create the Executor");
+
+    // Generator of printable bytearrays of max size 32
+    let mut generator = RandPrintablesGenerator::new(NonZero::new(32).unwrap());
+
+    // Generate 8 initial inputs
+    state
+        .generate_initial_inputs(&mut fuzzer, &mut executor, &mut generator, &mut mgr, 8)
+        .expect("Failed to generate the initial corpus");
+
+    // Set up a mutational stage with a basic bytes mutator
+    let mutator = HavocScheduledMutator::new(havoc_mutations());
+    let mut stages = tuple_list!(StdMutationalStage::new(mutator));
+
+    fuzzer
+        .fuzz_loop(&mut stages, &mut executor, &mut state, &mut mgr)
+        .expect("Error in the fuzzing loop");
+}

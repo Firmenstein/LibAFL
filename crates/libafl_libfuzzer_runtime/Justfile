@@ -1,0 +1,4 @@
+set windows-shell := ['cmd.exe', '/c']
+
+build:
+    {{ if os() == "windows" { "powershell -File build.ps1" } else { "./build.sh" } }}

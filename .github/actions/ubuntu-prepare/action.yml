@@ -1,0 +1,104 @@
+name: Setup Rust Environment
+description: Sets up the Rust environment for the CI workflow and optionally installs nightly
+
+# ---------- new section ----------
+inputs:
+  use_nightly:
+    description: "If true, install the Rust nightly toolchain instead of stable"
+    required: false
+    default: "false"
+# ---------------------------------
+
+runs:
+  using: composite
+  steps:
+    - name: Uninstall all currently installed Rust
+      shell: bash
+      run: |
+        sudo apt purge -y 'cargo*' 'rust*' 'rustup*'
+
+    - name: Install and cache deps
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          curl lsb-release wget software-properties-common gnupg shellcheck pax-utils \
+          libsqlite3-dev libpixman-1-dev libc6-dev gcc g++ build-essential libglib2.0-dev meson nlohmann-json3-dev
+
+    # ---------- toolchain selection ----------
+    - name: Install Rust (stable)
+      if: ${{ inputs.use_nightly == 'false' }}
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: clippy, rustfmt
+
+    - name: Install Rust (nightly)
+      if: ${{ inputs.use_nightly == 'true' }}
+      uses: dtolnay/rust-toolchain@nightly
+      with:
+        components: clippy, rustfmt
+    # -----------------------------------------
+
+    - name: Fix PATH for Cargo
+      shell: bash
+      run: echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+    - name: Install just
+      uses: extractions/setup-just@v4
+
+    - uses: taiki-e/install-action@cargo-hack
+
+    - name: Install LLVM
+      shell: bash
+      run: |
+        wget https://apt.llvm.org/llvm.sh
+        chmod +x llvm.sh
+        sudo ./llvm.sh ${{ env.MAIN_LLVM_VERSION }} all
+        sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-${{ env.MAIN_LLVM_VERSION }} 200
+        echo "LLVM_CONFIG_PATH=$(which llvm-config-${{ env.MAIN_LLVM_VERSION }})" >> "$GITHUB_ENV"
+        echo "LIBCLANG_PATH=/usr/lib/llvm-${{ env.MAIN_LLVM_VERSION }}/lib" >> "$GITHUB_ENV"
+
+    - name: Install Z3
+      id: z3
+      uses: cda-tum/setup-z3@v1
+      env:
+        NODE_EXTRA_CA_CERTS: /etc/ssl/certs/ca-certificates.crt
+        NODE_OPTIONS: --use-system-ca
+      with:
+        version: latest
+        add_to_library_path: true
+
+    - name: Install Z3 to system
+      shell: bash
+      run: |
+        # Replace Ubuntu's outdated libz3 (v4.8) in the host multiarch directory (/usr/lib/x86_64-linux-gnu/)
+        # with the latest Z3 installed by setup-z3, symlinking libz3.so.4 to libz3.so.
+        # Using ARCH_DIR=/usr/lib/$(uname -m)-linux-gnu ensures cross-compilation target paths are unaffected.
+        Z3_PATH="${{ steps.z3.outputs.z3-root }}"
+        Z3_PATH="${Z3_PATH:-$Z3_ROOT}"
+        if [ -n "$Z3_PATH" ]; then
+          sudo cp -r "$Z3_PATH/include/"* /usr/include/ 2>/dev/null || true
+          sudo cp -r "$Z3_PATH/include/"* /usr/local/include/ 2>/dev/null || true
+          ARCH_DIR="/usr/lib/$(uname -m)-linux-gnu"
+          if [ -d "$ARCH_DIR" ]; then
+            sudo rm -f "$ARCH_DIR/libz3"*
+            sudo cp -f "$Z3_PATH/bin/libz3"* "$ARCH_DIR/" 2>/dev/null || true
+            if [ -d "$Z3_PATH/lib" ]; then
+              sudo cp -f "$Z3_PATH/lib/libz3"* "$ARCH_DIR/" 2>/dev/null || true
+            fi
+            sudo ln -sf "$ARCH_DIR/libz3.so" "$ARCH_DIR/libz3.so.4" 2>/dev/null || true
+            sudo ln -sf "$ARCH_DIR/libz3.so" "$ARCH_DIR/libz3.so.4.8" 2>/dev/null || true
+            sudo ln -sf "$ARCH_DIR/libz3.so" "$ARCH_DIR/libz3.so.4.8.12" 2>/dev/null || true
+          else
+            sudo rm -f /usr/local/lib/libz3*
+            sudo cp -f "$Z3_PATH/bin/libz3"* /usr/local/lib/ 2>/dev/null || true
+            if [ -d "$Z3_PATH/lib" ]; then
+              sudo cp -f "$Z3_PATH/lib/libz3"* /usr/local/lib/ 2>/dev/null || true
+            fi
+          fi
+          sudo ldconfig 2>/dev/null || true
+        fi
+
+    - name: Symlink headers
+      shell: bash
+      run: sudo ln -s /usr/include/asm-generic /usr/include/asm
